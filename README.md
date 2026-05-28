@@ -23,4 +23,9 @@ One can also create a new anaconda environment, and then install necessary pytho
 ```
 conda install --yes --file requirements.txt
 ```
+### Train on SR
+python -m torch.distributed.launch --nproc_per_node=1 --master_port=1234 basicsr/train.py -opt SMoE_x2.yml --launcher pytorch
+### Test on SR
+python basicsr/test.py -opt test_SMoE_x2.yml
+
 # hfdmmamba
