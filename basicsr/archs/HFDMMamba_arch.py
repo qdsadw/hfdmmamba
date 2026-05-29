@@ -16,7 +16,7 @@ from basicsr.utils.registry import ARCH_REGISTRY
 # Meta Architecture
 ######################
 @ARCH_REGISTRY.register()
-class HFDMMamba1(nn.Module):
+class HFDMMamba(nn.Module):
     def __init__(self,
                  scale: int = 4,
                  in_chans: int = 3,
