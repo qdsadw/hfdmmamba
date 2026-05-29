@@ -41,7 +41,7 @@ datasets:
 
 # network structures
 network_g:
-  type: wavelet27
+  type: HFDMMamba
   scale: 2
   in_chans: 3
   num_experts: 3
