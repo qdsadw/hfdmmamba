@@ -267,41 +267,94 @@ class SS2D(nn.Module):
     def forward_core(self, x: torch.Tensor, dt_bias: torch.Tensor):
         B, C, H, W = x.shape
         L = H * W
-        K = 4
-        x_hwwh = torch.stack([x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)], dim=1).view(B, 2, -1, L)
-        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
-
-        dt_b = dt_bias.transpose(1, 2).view(B, 1, -1, L)
-        dt_b_hwwh = torch.stack([dt_b, torch.transpose(dt_b.view(B, -1, H, W), 2, 3).contiguous().view(B, 1, -1, L)], dim=1).view(B, 2, -1, L)
-        dt_bs = torch.cat([dt_b_hwwh, torch.flip(dt_b_hwwh, dims=[-1])], dim=1) # (B, K, D, L)
-
-        x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
-        dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
-        dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
-        
-        dts = dts + dt_bs
-        
-        xs = xs.float().view(B, -1, L)
-        dts = dts.contiguous().float().view(B, -1, L) # (b, k * d, l)
-        Bs = Bs.float().view(B, K, -1, L)
-        Cs = Cs.float().view(B, K, -1, L) # (b, k, d_state, l)
-        Ds = self.Ds.float().view(-1)
-        As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)
-        dt_projs_bias = self.dt_projs_bias.float().view(-1) # (k * d)
-        out_y = self.selective_scan(
-            xs, dts,
-            As, Bs, Cs, Ds, z=None,
-            delta_bias=dt_projs_bias,
-            delta_softplus=True,
-            return_last_state=False,
-        ).view(B, K, -1, L)
-        assert out_y.dtype == torch.float
-
-        inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
-        wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
-        invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
-
-        return out_y[:, 0], inv_y[:, 0], wh_y, invwh_y
+    
+        x_hw = x.reshape(B, C, L)
+        x_wh = x.transpose(2, 3).contiguous().reshape(B, C, L)
+    
+        dt_hw = dt_bias.transpose(1, 2).reshape(B, C, L)
+        dt_wh = (
+            dt_hw.reshape(B, C, H, W)
+            .transpose(2, 3)
+            .contiguous()
+            .reshape(B, C, L)
+        )
+    
+        # 保持原来的结果累加顺序：0、2、1、3
+        directions = (
+            (0, x_hw, dt_hw, False, False),
+            (2, x_hw, dt_hw, True,  False),
+            (1, x_wh, dt_wh, False, True),
+            (3, x_wh, dt_wh, True,  True),
+        )
+    
+        y = None
+    
+        for k, x_k, dt_k, reverse, transpose_back in directions:
+            if reverse:
+                x_k = torch.flip(x_k, dims=[-1])
+                dt_k = torch.flip(dt_k, dims=[-1])
+    
+            x_dbl = torch.einsum(
+                "b d l, c d -> b c l",
+                x_k,
+                self.x_proj_weight[k],
+            )
+    
+            dts, Bs, Cs = torch.split(
+                x_dbl,
+                [self.dt_rank, self.d_state, self.d_state],
+                dim=1,
+            )
+    
+            dts = torch.einsum(
+                "b r l, d r -> b d l",
+                dts,
+                self.dt_projs_weight[k],
+            )
+    
+            dts = dts + dt_k
+    
+            start = k * self.d_inner
+            end = (k + 1) * self.d_inner
+    
+            As = -torch.exp(
+                self.A_logs[start:end].float()
+            ).reshape(-1, self.d_state)
+    
+            Ds = self.Ds[start:end].float().reshape(-1)
+    
+            delta_bias = self.dt_projs_bias[k].float().reshape(-1)
+    
+            y_k = self.selective_scan(
+                x_k.float(),
+                dts.contiguous().float(),
+                As,
+                Bs.float(),
+                Cs.float(),
+                Ds,
+                z=None,
+                delta_bias=delta_bias,
+                delta_softplus=True,
+                return_last_state=False,
+            )
+    
+            if reverse:
+                y_k = torch.flip(y_k, dims=[-1])
+    
+            if transpose_back:
+                y_k = (
+                    y_k.reshape(B, C, W, H)
+                    .transpose(2, 3)
+                    .contiguous()
+                    .reshape(B, C, L)
+                )
+    
+            if y is None:
+                y = y_k
+            else:
+                y = y + y_k
+    
+        return y
 
     def forward(self, x: torch.Tensor, **kwargs):
         B, C, H, W = x.shape
@@ -321,9 +374,7 @@ class SS2D(nn.Module):
         x_conv = self.act(self.conv2d(x_conv))
         
         # 5. 核心扫描 (传入调制后的特征)
-        y1, y2, y3, y4 = self.forward_core(x_conv, dt_bias)
-        
-        y = y1 + y2 + y3 + y4
+        y = self.forward_core(x_conv, dt_bias)
         y = torch.transpose(y, dim0=1, dim1=2).contiguous()
         y = self.out_norm(y)
         y = y * F.silu(z)
